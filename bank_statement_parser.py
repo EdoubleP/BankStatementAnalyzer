@@ -1209,7 +1209,11 @@ def main():
         cols = [c for c in ['source_file','date','description','amount','balance','section'] if c in txdf.columns]
         txdf = txdf[cols]
         txdf.sort_values(by=['source_file', 'date'], inplace=True)
-        txdf.to_csv(os.path.join(args.outdir, "transactions.csv"), index=False)
+        tx_path = os.path.join(args.outdir, "transactions.csv")
+        if summaries and len(summaries) == 1:
+            slug = re.sub(r'[^A-Za-z0-9_-]+', '_', summaries[0].get('Company Name', 'transactions')).strip('_')
+            tx_path = os.path.join(args.outdir, f"{slug}_transactions.csv")
+        txdf.to_csv(tx_path, index=False)
 
     if summaries:
         cols = [
@@ -1223,7 +1227,13 @@ def main():
             'Large Deposits (Count)', 'Large Deposits (Total)', 'Largest Deposit (Any)'
         ]
         sdf = pd.DataFrame(summaries, columns=cols)
-        sdf.to_excel(os.path.join(args.outdir, "summary.xlsx"), index=False)
+        if len(summaries) == 1:
+            slug = re.sub(r'[^A-Za-z0-9_-]+', '_', summaries[0].get('Company Name', 'summary')).strip('_')
+            sheet = slug[:31] or 'Summary'
+            out_xlsx = os.path.join(args.outdir, f"{slug}_summary.xlsx")
+            sdf.to_excel(out_xlsx, index=False, sheet_name=sheet)
+        else:
+            sdf.to_excel(os.path.join(args.outdir, "summary.xlsx"), index=False)
 
     print(f"\nDone. Outputs in: {os.path.abspath(args.outdir)}")
     if not all_txns and not summaries:
