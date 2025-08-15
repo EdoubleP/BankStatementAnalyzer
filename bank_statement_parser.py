@@ -10,7 +10,6 @@ import pdfplumber
 import pandas as pd
 
 # ------------------ regex ------------------
-# Accept amounts like 12.34 or .09
 MONEY_PAT = re.compile(
     r'[-+]?\$?\s?((?:\d{1,3}(?:,\d{3})*|\d+)?(?:\.\d{2}))'
 )
@@ -30,7 +29,7 @@ def load_config(path):
 def try_parse_date(s, default_year=None):
     try:
         d = dtparse.parse(str(s), fuzzy=True)
-        if default_year and re.fullmatch(r'\d{1,2}[/-]\d{1,2}', str(s).strip()):
+        if default_year and re.fullmatch(r'\\d{1,2}[/-]\\d{1,2}', str(s).strip()):
             d = d.replace(year=default_year)
         return d
     except Exception:
@@ -79,14 +78,14 @@ def guess_company_name(full_text):
 
 def extract_statement_period(text):
     # Matches e.g. "July 1, 2022 - July 31, 2022" OR "3/01/23 thru 4/02/23"
-    sep = r'(?:-+|–|—|\bto\b|\bthru\b|\bthrough\b)'
-    m = re.search(r'(' + DATE_PAT.pattern + r')\s*' + sep + r'\s*(' + DATE_PAT.pattern + r')', text, re.I)
+    sep = r'(?:-+|–|—|\\bto\\b|\\bthru\\b|\\bthrough\\b)'
+    m = re.search(r'(' + DATE_PAT.pattern + r')\\s*' + sep + r'\\s*(' + DATE_PAT.pattern + r')', text, re.I)
     if m:
         d1 = try_parse_date(m.group(1))
         d2 = try_parse_date(m.group(2))
         if d1 and d2:
             return d1.date(), d2.date()
-    m2 = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}', text, re.I)
+    m2 = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}', text, re.I)
     if m2:
         d = dtparse.parse(m2.group(0))
         start = d.replace(day=1).date()
@@ -95,7 +94,7 @@ def extract_statement_period(text):
     return None, None
 
 def extract_plain_text(pdf):
-    return "\n".join([(p.extract_text() or "") for p in pdf.pages])
+    return "\\n".join([(p.extract_text() or "") for p in pdf.pages])
 
 def find_section(text, header, next_headers):
     low = text.lower()
@@ -130,7 +129,9 @@ INDEP_HEADERS = [
     "DAILY BALANCE SUMMARY",
     "SERVICE CHARGE SUMMARY"
 ]
-INDEP_CHECK_TWOCOL = re.compile(r'(\d{1,2}/\d{2})\s+(\d{3,}\*?)\s+\$?([0-9,]+\.\d{2})')
+INDEP_CHECK_TWOCOL = re.compile(
+    r'(\d{1,2}/\d{2})\s+(\d{3,}\*?)\s+\$?([0-9,]+\.\d{2})'
+)
 
 def parse_indep_block(block_text, year, sign, section_name):
     """Group by lines that start with mm/dd; amount = last money token; multi-line friendly; ignore 'Total' lines."""
@@ -266,20 +267,20 @@ def parse_regions_block(block_text, year, sign, section_name):
         if not line.strip(): continue
         if is_total_line(line):
             if current:
-                rec = flush(current); 
+                rec = flush(current);
                 if rec: txns.append(rec)
                 current = []
             continue
         if MD_SLASH.match(line):
             if current:
-                rec = flush(current); 
+                rec = flush(current);
                 if rec: txns.append(rec)
                 current = []
             current.append(line)
         else:
             if current: current.append(line)
     if current:
-        rec = flush(current); 
+        rec = flush(current);
         if rec: txns.append(rec)
     return txns
 
@@ -340,11 +341,65 @@ def parse_investors(full_text, period_year):
         if in_detail and ('check register' in low or low.startswith('check register')): in_detail = False
         if not in_detail: continue
         if MD_SLASH.match(line):
-            if current: blocks.append("\n".join(current)); current = []
+            if current: blocks.append("\\n".join(current)); current = []
             current.append(line)
         else:
             if current: current.append(line)
-    if current: blocks.append("\n".join(current))
+    if current: blocks.append("\\n".join(current))
+    txns = []
+    def parse_block(block_text):
+        m = MD_SLASH.match(block_text.splitlines()[0])
+        if not m: return None
+        md = m.group(1); d = try_parse_date(md, default_year=period_year)
+        if not d: return None
+        tokens = []
+        for mm in MONEY_SIGNED.finditer(block_text):
+            val = float(mm.group(1).replace(',', '')); neg = True if mm.group(2) else False
+            tokens.append((val, neg, mm.start()))
+        if len(tokens) < 2: return None
+        bal = tokens[-1][0]
+        prev = tokens[:-1]
+        neg_prev = [t for t in prev if t[1]]
+        if neg_prev: amt = -neg_prev[-1][0]
+        else:
+            cand = prev[-1]; amt = -cand[0] if cand[1] else cand[0]
+        desc = block_text[len(md):].strip(" -:\\n\\t")
+        desc = re.sub(r'\\$?\\s*(?:\\d{1,3}(?:,\\d{3})*|\\d+)?(?:\\.\\d{2})(?:-)?', '', desc).strip()
+        if 'beginning balance' in desc.lower(): return None
+        return {'date': d.date(), 'description': re.sub(r'\\s+', ' ', desc),
+                'amount': amt, 'balance': bal, 'section': 'ACCOUNT ACTIVITY DETAIL'}
+    for b in blocks:
+        rec = parse_block(b)
+        if rec: txns.append(rec)
+    daily = {}
+    if txns:
+        df = pd.DataFrame(txns)
+        if 'balance' in df and df['balance'].notna().any():
+            s = df[['date', 'balance']].dropna().groupby('date')['balance'].last()
+            daily = {k: float(v) for k, v in s.to_dict().items()}
+    return txns, daily
+
+# ---- ECSB ----
+def detect_header_row(df, must_have):
+    for i in range(min(10, len(df))):
+        row_text = " ".join([str(x or "") for x in df.iloc[i].tolist()]).lower()
+        if all(tok in row_text for tok in must_have):
+            return i
+    return None
+
+def parse_ecsb_tables(tables, year):
+    txns = []
+    for df in tables:
+        hdr_idx = detect_header_row(df, must_have=['date','transaction','withdrawal','deposit','balance'])
+        if hdr_idx is None: continue
+        data = df.iloc[hdr_idx+1:].copy()
+        headers = [str(c).strip().lower() for c in df.iloc[hdr_idx].tolist()]
+        data.columns = headers
+        cols = list(data.columns)
+        def col_like(cands):
+            for c in cols:
+                if any(x in c for x in cands): return c
+
     txns = []
     def parse_block(block_text):
         m = MD_SLASH.match(block_text.splitlines()[0])
@@ -398,7 +453,6 @@ def parse_ecsb_tables(tables, year):
         def col_like(cands):
             for c in cols:
                 if any(x in c for x in cands): return c
-            return None
         c_date = col_like(['date']); c_desc = col_like(['transaction'])
         c_with = col_like(['withdrawal']); c_dep = col_like(['deposit']); c_bal = col_like(['balance'])
         current = None
@@ -442,7 +496,7 @@ def parse_keybank_block_transactions(block_text, year, sign, section_name):
     txns, current = [], []
     def flush(block):
         if not block: return None
-        m = MD_ANY.match(block[0]); 
+        m = MD_ANY.match(block[0]);
         if not m: return None
         md = m.group(1)
         d = try_parse_date(md, default_year=year)
@@ -456,14 +510,14 @@ def parse_keybank_block_transactions(block_text, year, sign, section_name):
         if not line.strip(): continue
         if MD_ANY.match(line):
             if current:
-                rec = flush(current); 
+                rec = flush(current);
                 if rec: txns.append(rec)
                 current = []
             current.append(line)
         else:
             if current: current.append(line)
     if current:
-        rec = flush(current); 
+        rec = flush(current);
         if rec: txns.append(rec)
     return txns
 
@@ -477,7 +531,7 @@ def parse_keybank_checks(subtractions_text, year):
     paper_block = subtractions_text[i_checks:(i_withdr if i_withdr != -1 else len(subtractions_text))]
     out = []
     for chk, md, amt in CHECK_ANY.findall(paper_block):
-        d = try_parse_date(md, default_year=year); 
+        d = try_parse_date(md, default_year=year);
         if not d: continue
         try: amount = float(amt.replace(',', ''))
         except Exception: continue
@@ -503,7 +557,7 @@ def parse_keybank_fees(text, year):
     txns, current = [], []
     def flush(block):
         if not block: return None
-        m = MD_ANY.match(block[0]); 
+        m = MD_ANY.match(block[0]);
         if not m: return None
         md = m.group(1); d = try_parse_date(md, default_year=year)
         if not d: return None
@@ -517,14 +571,14 @@ def parse_keybank_fees(text, year):
         if not line.strip(): continue
         if MD_ANY.match(line):
             if current:
-                rec = flush(current); 
+                rec = flush(current);
                 if rec: txns.append(rec)
                 current = []
             current.append(line)
         else:
             if current: current.append(line)
     if current:
-        rec = flush(current); 
+        rec = flush(current);
         if rec: txns.append(rec)
     return txns
 
@@ -559,7 +613,7 @@ def parse_bofa_section_transactions(section_text, year, sign, section_name):
     txns, current = [], []
     def flush(block):
         if not block: return None
-        m = MD_SLASH.match(block[0]); 
+        m = MD_SLASH.match(block[0]);
         if not m: return None
         md = m.group(1); d = try_parse_date(md, default_year=year)
         if not d: return None
@@ -572,14 +626,14 @@ def parse_bofa_section_transactions(section_text, year, sign, section_name):
         if not line.strip(): continue
         if MD_SLASH.match(line):
             if current:
-                rec = flush(current); 
+                rec = flush(current);
                 if rec: txns.append(rec)
                 current = []
             current.append(line)
         else:
             if current: current.append(line)
     if current:
-        rec = flush(current); 
+        rec = flush(current);
         if rec: txns.append(rec)
     return txns
 
@@ -644,13 +698,13 @@ CHASE_SECTION_HEADERS = [
 def parse_chase_section_transactions(section_text, year, sign, section_name):
     if not section_text:
         return []
-    lines = [l.rstrip() for l in section_text.splitlines()]
+    lines = [l.rstrip() for l in section_text .splitlines()]
     if lines:
         lines = lines[1:] if lines[0].strip() else lines
     txns, current = [], []
     def flush(block):
         if not block: return None
-        m = MD_SLASH.match(block[0]); 
+        m = MD_SLASH.match(block[0]);
         if not m: return None
         md = m.group(1); d = try_parse_date(md, default_year=year)
         if not d: return None
@@ -663,14 +717,14 @@ def parse_chase_section_transactions(section_text, year, sign, section_name):
         if not line.strip(): continue
         if MD_SLASH.match(line):
             if current:
-                rec = flush(current); 
+                rec = flush(current);
                 if rec: txns.append(rec)
                 current = []
             current.append(line)
         else:
             if current: current.append(line)
     if current:
-        rec = flush(current); 
+        rec = flush(current);
         if rec: txns.append(rec)
     return txns
 
@@ -743,7 +797,7 @@ def detect_recurring_debit(df):
                 continue
             med = pd.Series(deltas).median()
             amt_mode = grp['amount'].mode()
-            amt_mode_val = float(amt_mode.iloc[0]) if not amt_mode.empty else float(grp['amount'].iloc[-1])
+            amt_mode_val = float(amt_mode.iloc[0]) if not amt_mode .empty else float(grp['amount'].iloc[-1])
             freq = ''
             if 1 <= med <= 2:   freq = 'daily'
             elif 6 <= med <= 8: freq = 'weekly'
@@ -779,7 +833,7 @@ def summarize(txns, cfg, daily_balances=None):
             'Largest Deposit (Any)': None
         }
 
-    if not df.empty:
+    if not df .empty:
         deposits = df[df['amount'] > 0] if cfg.get('assume_deposit_if_positive', True) else df[df['amount'] >= 0.01]
         total_deposits = float(deposits['amount'].sum()) if not deposits.empty else 0.0
         num_deposits = int(len(deposits))
@@ -798,7 +852,6 @@ def summarize(txns, cfg, daily_balances=None):
         if not by_day.empty:
             neg_days = int((by_day < 0).sum())
             avg_bal = float(by_day.mean())
-
     mca_keys    = [k.lower() for k in cfg.get('mca_keywords', [])]
     mca_lenders = [k.lower() for k in cfg.get('mca_lenders', [])]
     fund_pos_terms = [k.lower() for k in cfg.get('mca_funding_positive_terms', [])]
@@ -997,7 +1050,6 @@ def process_pdf(path, cfg):
             if not txns:
                 txns = coerce_transactions_from_text(full_text)
             daily = None
-
     for t in txns:
         t['source_file'] = os.path.basename(path)
 
@@ -1040,7 +1092,7 @@ def parse_banner_block(block_text, year, sign, section_name):
         md = m.group(1)
         d = try_parse_date(md, default_year=year)
         if not d: return None
-        text = " ".join([b.strip() for b in block if b.strip() and not is_total(b)])
+        text = " ".join([b.strip() for b in block if b .strip() and not is_total(b)])
         amt = parse_amount_from_block(text)
         if amt is None: return None
         desc = text[len(md):].strip(" -:•")
